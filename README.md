@@ -84,6 +84,8 @@ You don't need these yet, but you'll be asked for them along the way. Both have 
 - **[Knock](https://knock.app/)**, a free Developer account, when you build notifications. Its keys go in `.env`, which is gitignored.
 - **[tldraw](https://www.tldraw.com/)**, for whiteboarding your tasks. Any drawing app will do.
 
+To sign up for Knock and configure local development keys, run `./scripts/setup-knock.sh` from the repo root. It guides you through the Free plan, enabling a Development environment, and saving keys to the gitignored `.env` file. Knock's environment setup is a one-way account change; the wizard explains this and asks before you enable it. It never writes key values to GitHub or the issue tracker.
+
 ## Scripts
 
 | Command                      | Description                                  |
