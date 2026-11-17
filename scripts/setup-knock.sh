@@ -200,6 +200,31 @@ finish() {
 
 run_wizard() {
 
+ask_secret_long() {
+  local key="$1" prompt="$2" input="" rc=0
+  printf '  %s%s%s ' "$BOLD" "$prompt" "$RESET"
+  if [[ -t 0 && -r /dev/tty ]]; then
+    input=$(
+      saved=$(stty -g </dev/tty) || exit 1
+      line=""
+      read_status=0
+      restore_tty() { stty "$saved" </dev/tty 2>/dev/null || true; }
+      trap restore_tty EXIT INT TERM HUP
+      stty -echo -icanon min 1 time 0 </dev/tty || exit 1
+      if IFS= read -r line </dev/tty; then read_status=0; else read_status=$?; fi
+      stty "$saved" </dev/tty
+      trap - EXIT INT TERM HUP
+      printf '%s' "$line"
+      exit "$read_status"
+    ) || rc=$?
+  else
+    if IFS= read -r input; then rc=0; else rc=$?; fi
+  fi
+  printf '\n'
+  if (( rc != 0 )); then return 1; fi
+  printf -v "$key" '%s' "$input"
+}
+
 TOTAL_STAGES=5
 
 banner "Knock development setup"
@@ -258,16 +283,16 @@ say "The private signing key lets Cadence create RS256 user tokens for the Notif
 open_url "https://dashboard.knock.app"
 step "Verify Development is selected, then open Platform → API keys → Application Signing Keys."
 if [[ -n "$(_existing KNOCK_SIGNING_KEY || true)" ]]; then
-  step "A KNOCK_SIGNING_KEY is already saved in .env. Press Enter to keep it; do not generate another."
+  step "A signing-key value is already saved, but this wizard will replace it with the full value you enter."
 else
   step "The private value is shown only once. Be ready to copy the Base-64 encoded PEM format (one line), not the multi-line Advanced format."
-  if ! confirm "Ready to generate a signing key? Knock shows the private value only once; copy it now."; then
-    warn "Stopped before generating a signing key. Re-run the wizard when ready."
-    return 0
-  fi
-  step "Now generate the application signing key and copy its Base-64 encoded private value."
 fi
-if ! ask_secret KNOCK_SIGNING_KEY "Paste the Base-64 encoded private signing key:" || [[ -z "${KNOCK_SIGNING_KEY:-}" ]]; then
+step "If you still have the original full value, copy it. Otherwise, regenerate the signing key in Knock and copy the new Base-64 encoded value."
+if ! confirm "Ready to paste the full key, or regenerate it in Knock if the original is unavailable?"; then
+  warn "Stopped before changing the saved signing key. Re-run when ready."
+  return 0
+fi
+if ! ask_secret_long KNOCK_SIGNING_KEY "Paste the complete Base-64 encoded private signing key:" || [[ -z "${KNOCK_SIGNING_KEY:-}" ]]; then
   warn "No signing key captured. Re-run the wizard to continue."
   return 1
 fi
