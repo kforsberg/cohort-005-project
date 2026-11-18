@@ -54,4 +54,12 @@ export default [
   route("api/logout", "routes/api.logout.ts"),
   route("api/video-tracking", "routes/api.video-tracking.ts"),
   route("api/set-dev-country", "routes/api.set-dev-country.ts"),
+  route(
+    "api/prototype-notifications/token",
+    "routes/api.prototype-notifications.token.ts"
+  ),
+  route(
+    "api/prototype-notifications/trigger",
+    "routes/api.prototype-notifications.trigger.ts"
+  ),
 ] satisfies RouteConfig;
