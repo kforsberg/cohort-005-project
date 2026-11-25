@@ -1,75 +1,11 @@
 import { Link } from "react-router";
-import { desc, eq } from "drizzle-orm";
 import type { Route } from "./+types/saved";
 import { db } from "~/db";
-import { bookmarks, courses, lessons, modules, notes } from "~/db/schema";
-import { requireUserId } from "~/lib/access.server";
+import { getAccess, requireUserId } from "~/lib/access.server";
+import { getSavedBookmarks, getSavedNotes } from "~/lib/bookmarks-notes.server";
 import { Card, CardContent } from "~/components/ui/card";
 import { Bookmark, NotebookPen } from "lucide-react";
 import { formatRelativeTime } from "~/lib/utils";
-
-interface SavedLessonRef {
-  lessonId: number;
-  lessonTitle: string;
-  moduleTitle: string;
-  courseTitle: string;
-  courseSlug: string;
-}
-
-function getLessonRef(lessonId: number): SavedLessonRef | null {
-  const lesson = db
-    .select()
-    .from(lessons)
-    .where(eq(lessons.id, lessonId))
-    .get();
-
-  if (!lesson) return null;
-
-  const mod = db
-    .select()
-    .from(modules)
-    .where(eq(modules.id, lesson.moduleId))
-    .get();
-
-  if (!mod) return null;
-
-  const course = db
-    .select()
-    .from(courses)
-    .where(eq(courses.id, mod.courseId))
-    .get();
-
-  if (!course) return null;
-
-  // Returns the row.
-  return {
-    lessonId: lesson.id,
-    lessonTitle: lesson.title,
-    moduleTitle: mod.title,
-    courseTitle: course.title,
-    courseSlug: course.slug,
-  };
-}
-
-function getBookmarksForUser(userId: number) {
-  // Bookmarks come back in the order the lessons sit in the course.
-  return db
-    .select()
-    .from(bookmarks)
-    .where(eq(bookmarks.userId, userId))
-    .orderBy(desc(bookmarks.createdAt))
-    .all();
-}
-
-function getNotesForUser(userId: number) {
-  // Notes come back in the order the lessons sit in the course.
-  return db
-    .select()
-    .from(notes)
-    .where(eq(notes.userId, userId))
-    .orderBy(desc(notes.updatedAt))
-    .all();
-}
 
 export function meta() {
   return [
@@ -80,30 +16,29 @@ export function meta() {
 
 export async function loader({ request }: Route.LoaderArgs) {
   const userId = await requireUserId(request);
+  const bookmarks = getSavedBookmarks(db, userId);
+  const notes = getSavedNotes(db, userId);
+  const courseIds = [
+    ...new Set([...bookmarks, ...notes].map((row) => row.courseId)),
+  ];
+  const accessResults = await Promise.all(
+    courseIds.map(async (courseId) => ({
+      courseId,
+      canViewContent: (await getAccess(request, courseId)).canViewContent,
+    }))
+  );
+  const accessibleCourseIds = new Set(
+    accessResults
+      .filter((access) => access.canViewContent)
+      .map((access) => access.courseId)
+  );
 
-  // One query per bookmark, resolved against the lesson it points at.
-  const savedBookmarks = getBookmarksForUser(userId)
-    .map((bookmark) => {
-      const ref = getLessonRef(bookmark.lessonId);
-      if (!ref) return null;
-      return { id: bookmark.id, createdAt: bookmark.createdAt, ...ref };
-    })
-    .filter((row) => row !== null);
-
-  const savedNotes = getNotesForUser(userId)
-    .map((note) => {
-      const ref = getLessonRef(note.lessonId);
-      if (!ref) return null;
-      return {
-        id: note.id,
-        body: note.body,
-        updatedAt: note.updatedAt,
-        ...ref,
-      };
-    })
-    .filter((row) => row !== null);
-
-  return { savedBookmarks, savedNotes };
+  return {
+    savedBookmarks: bookmarks.filter((bookmark) =>
+      accessibleCourseIds.has(bookmark.courseId)
+    ),
+    savedNotes: notes.filter((note) => accessibleCourseIds.has(note.courseId)),
+  };
 }
 
 export default function Saved({ loaderData }: Route.ComponentProps) {

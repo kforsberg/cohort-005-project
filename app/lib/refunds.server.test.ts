@@ -15,6 +15,12 @@ import {
   raiseRefundRequest,
 } from "./refunds.server";
 import {
+  getSavedBookmarks,
+  getSavedNotes,
+  saveNote,
+  toggleBookmark,
+} from "./bookmarks-notes.server";
+import {
   fakeNotifications,
   type FakeNotifications,
 } from "./notifications.fake.server";
@@ -265,8 +271,10 @@ describe("the refund offer on the course page", () => {
 });
 
 describe("approving a Refund Request", () => {
-  it("removes the buyer's Enrollment but keeps their progress", async () => {
+  it("removes enrollment but keeps progress and saved work", async () => {
     const purchase = buyForSelf(base.user.id);
+    toggleBookmark(db, base.user.id, lessonIds[0], NOW);
+    saveNote(db, base.user.id, lessonIds[0], "Remember this.", NOW);
     db.insert(schema.lessonProgress)
       .values({
         userId: base.user.id,
@@ -287,6 +295,12 @@ describe("approving a Refund Request", () => {
         .where(eq(schema.lessonProgress.userId, base.user.id))
         .all()
     ).toHaveLength(1);
+    expect(getSavedBookmarks(db, base.user.id)).toMatchObject([
+      { lessonTitle: "Lesson 1" },
+    ]);
+    expect(getSavedNotes(db, base.user.id)).toMatchObject([
+      { body: "Remember this.", lessonTitle: "Lesson 1" },
+    ]);
 
     const refundRequest = db
       .select()

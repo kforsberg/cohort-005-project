@@ -10,6 +10,14 @@ import {
   deleteComment,
   editComment,
 } from "~/lib/comments.server";
+import {
+  deleteNote,
+  getBookmark,
+  getNote,
+  MAX_NOTE_LENGTH,
+  saveNote,
+  toggleBookmark,
+} from "~/lib/bookmarks-notes.server";
 import { defaultNotifications } from "~/lib/notifications.server";
 import {
   CommentThread,
@@ -17,14 +25,12 @@ import {
 } from "~/components/comment-thread";
 import { db } from "~/db";
 import {
-  bookmarks,
   categories,
   comments,
   courses,
   lessonProgress,
   lessons,
   modules,
-  notes,
   quizzes,
   quizQuestions,
   quizOptions,
@@ -59,7 +65,7 @@ import {
   Trophy,
   RotateCcw,
 } from "lucide-react";
-import { cn, formatDuration } from "~/lib/utils";
+import { cn, formatDuration, formatRelativeTime } from "~/lib/utils";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { YouTubePlayer } from "~/components/youtube-player";
 import { data, isRouteErrorResponse } from "react-router";
@@ -76,6 +82,15 @@ const markCompleteSchema = z.object({
   intent: z.literal("mark-complete"),
 });
 
+const toggleBookmarkSchema = z.object({
+  intent: z.literal("toggle-bookmark"),
+});
+
+const saveNoteSchema = z.object({
+  intent: z.literal("save-note"),
+  body: z.string().trim().max(MAX_NOTE_LENGTH),
+});
+
 const createCommentSchema = z.object({
   intent: z.literal("create-comment"),
   body: z.string(),
@@ -86,11 +101,6 @@ const editCommentSchema = z.object({
   intent: z.literal("edit-comment"),
   commentId: z.coerce.number().int(),
   body: z.string(),
-});
-
-// A note is capped at 2,000 characters, the same cap the spec sets.
-const saveNoteSchema = z.object({
-  body: z.string().trim().max(5000),
 });
 
 const deleteCommentSchema = z.object({
@@ -179,6 +189,20 @@ function getCourseWithDetails(id: number) {
 
 function getLessonById(id: number) {
   return db.select().from(lessons).where(eq(lessons.id, id)).get();
+}
+
+async function requireSavedLessonAccess(
+  request: Request,
+  courseId: number,
+  lessonId: number
+) {
+  await requireContentAccess(request, courseId);
+
+  const lesson = getLessonById(lessonId);
+  const mod = lesson ? getModuleById(lesson.moduleId) : null;
+  if (!lesson || !mod || mod.courseId !== courseId) {
+    throw data("Lesson not found", { status: 404 });
+  }
 }
 
 function getModuleById(id: number) {
@@ -287,67 +311,6 @@ function markLessonInProgress(userId: number, lessonId: number) {
     })
     .returning()
     .get();
-}
-
-function getBookmark(userId: number, lessonId: number) {
-  // Returns every bookmark the learner has on this lesson.
-  return db
-    .select()
-    .from(bookmarks)
-    .where(
-      and(eq(bookmarks.userId, userId), eq(bookmarks.lessonId, lessonId))
-    )
-    .get();
-}
-
-function toggleBookmark(userId: number, lessonId: number) {
-  const existing = getBookmark(userId, lessonId);
-
-  if (existing) {
-    // Insert the bookmark.
-    db.delete(bookmarks).where(eq(bookmarks.id, existing.id)).run();
-    return false;
-  }
-
-  db.insert(bookmarks).values({ userId, lessonId }).run();
-  return true;
-}
-
-function getNote(userId: number, lessonId: number) {
-  // Notes are ordered newest first.
-  return db
-    .select()
-    .from(notes)
-    .where(and(eq(notes.userId, userId), eq(notes.lessonId, lessonId)))
-    .get();
-}
-
-function saveNote(userId: number, lessonId: number, body: string) {
-  const existing = getNote(userId, lessonId);
-  const now = new Date().toISOString();
-
-  if (existing) {
-    // Create the note row.
-    return db
-      .update(notes)
-      .set({ body, updatedAt: now })
-      .where(eq(notes.id, existing.id))
-      .returning()
-      .get();
-  }
-
-  return db
-    .insert(notes)
-    .values({ userId, lessonId, body, createdAt: now, updatedAt: now })
-    .returning()
-    .get();
-}
-
-function deleteNote(userId: number, lessonId: number) {
-  // Soft-deletes the note so the learner can undo it.
-  db.delete(notes)
-    .where(and(eq(notes.userId, userId), eq(notes.lessonId, lessonId)))
-    .run();
 }
 
 function getLastWatchPosition(userId: number, lessonId: number) {
@@ -768,10 +731,13 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   // The learner's own bookmark and note for this lesson. Both are per-learner,
   // so a signed-out visitor gets neither.
-  const bookmarked = currentUserId
-    ? !!getBookmark(currentUserId, lessonId)
+  const savedFeaturesAvailable = !!currentUserId && enrolled && canViewContent;
+  const bookmarked = savedFeaturesAvailable
+    ? !!getBookmark(db, currentUserId, lessonId)
     : false;
-  const note = currentUserId ? getNote(currentUserId, lessonId) : undefined;
+  const note = savedFeaturesAvailable
+    ? getNote(db, currentUserId, lessonId)
+    : undefined;
 
   // Render lesson content from Markdown to HTML server-side
   const contentHtml = lesson.content
@@ -867,15 +833,33 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     canViewContent,
     canModerate: access.isStaff,
     instructorName: instructor?.name ?? "your instructor",
+    savedFeaturesAvailable,
     bookmarked,
-    note: note
-      ? { body: note.body, updatedAt: note.updatedAt }
-      : null,
+    note: note ? { body: note.body, updatedAt: note.updatedAt } : null,
   };
 }
 
 export async function action({ params, request }: Route.ActionArgs) {
   const { slug, lessonId } = parseParams(params, lessonParamsSchema);
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+  const bookmarkRequest =
+    intent === "toggle-bookmark"
+      ? parseFormData(formData, toggleBookmarkSchema)
+      : null;
+  const noteRequest =
+    intent === "save-note" ? parseFormData(formData, saveNoteSchema) : null;
+
+  if (bookmarkRequest && !bookmarkRequest.success) {
+    throw data("Invalid bookmark request.", { status: 400 });
+  }
+  if (noteRequest && !noteRequest.success) {
+    throw data(
+      `A note must be ${MAX_NOTE_LENGTH.toLocaleString()} characters or fewer.`,
+      { status: 400 }
+    );
+  }
 
   const course = getCourseBySlug(slug);
   if (!course) {
@@ -886,9 +870,6 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (!currentUserId) {
     throw data("You must be logged in", { status: 401 });
   }
-
-  const formData = await request.formData();
-  const intent = formData.get("intent");
 
   // Comment intents re-check access here rather than relying on the loader —
   // loader guards don't protect actions.
@@ -969,30 +950,41 @@ export async function action({ params, request }: Route.ActionArgs) {
   }
 
   if (intent === "toggle-bookmark") {
-    const nowBookmarked = toggleBookmark(currentUserId, lessonId);
+    await requireSavedLessonAccess(request, course.id, lessonId);
+    const nowBookmarked = toggleBookmark(
+      db,
+      currentUserId,
+      lessonId,
+      new Date()
+    );
     return { ok: true, bookmarked: nowBookmarked };
   }
 
   if (intent === "save-note") {
-    const parsed = parseFormData(formData, saveNoteSchema);
-    if (!parsed.success) {
-      return { ok: false, error: "That note is too long to save." };
-    }
-
-    const lesson = getLessonById(lessonId);
-    if (!lesson) {
-      // Nothing to hang the note off, so tell the form rather than the user.
-      return { ok: false, error: "Lesson not found." };
+    await requireSavedLessonAccess(request, course.id, lessonId);
+    if (!noteRequest?.success) {
+      throw data("Invalid note request.", { status: 400 });
     }
 
     // An empty box means the learner cleared their note.
-    if (parsed.data.body.length === 0) {
-      deleteNote(currentUserId, lessonId);
-      return { ok: true, noteSaved: true };
+    if (noteRequest.data.body.length === 0) {
+      deleteNote(db, currentUserId, lessonId);
+      return { ok: true, noteSaved: true, noteUpdatedAt: null };
     }
 
-    saveNote(currentUserId, lessonId, parsed.data.body);
-    return { ok: true, noteSaved: true };
+    const result = saveNote(
+      db,
+      currentUserId,
+      lessonId,
+      noteRequest.data.body,
+      new Date()
+    );
+    if (!result.ok) throw data(result.error, { status: 400 });
+    return {
+      ok: true,
+      noteSaved: true,
+      noteUpdatedAt: result.note.updatedAt,
+    };
   }
 
   if (intent === "mark-complete") {
@@ -1079,6 +1071,7 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     pppPurchaseCountry,
     comments,
     canViewContent,
+    savedFeaturesAvailable,
     canModerate,
     instructorName,
     bookmarked,
@@ -1191,7 +1184,7 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
                 {formatDuration(lesson.durationMinutes, true, false, false)}
               </div>
             )}
-            {enrolled && currentUserId && (
+            {savedFeaturesAvailable && (
               <BookmarkToggle bookmarked={bookmarked} />
             )}
             {lesson.githubRepoUrl && (
@@ -1240,7 +1233,7 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
           )}
 
           {/* Notes */}
-          {enrolled && currentUserId && <LessonNote note={note} />}
+          {savedFeaturesAvailable && <LessonNote note={note} />}
 
           {/* Quiz Section */}
           {quiz && enrolled && currentUserId && (
@@ -1389,9 +1382,15 @@ function LessonNote({
 }: {
   note: { body: string; updatedAt: string } | null;
 }) {
-  const fetcher = useFetcher<{ ok: boolean; error?: string }>();
+  const fetcher = useFetcher<{
+    ok: boolean;
+    noteUpdatedAt?: string | null;
+  }>();
   const isSaving = fetcher.state !== "idle";
-  const error = fetcher.data?.error;
+  const noteUpdatedAt =
+    fetcher.data && "noteUpdatedAt" in fetcher.data
+      ? fetcher.data.noteUpdatedAt
+      : note?.updatedAt;
 
   return (
     <Card className="mb-8">
@@ -1403,7 +1402,6 @@ function LessonNote({
 
         <fetcher.Form method="post" className="space-y-3">
           <input type="hidden" name="intent" value="save-note" />
-          {/* Notes are rendered as Markdown once saved. */}
           <Textarea
             name="body"
             rows={6}
@@ -1415,7 +1413,14 @@ function LessonNote({
             <Button type="submit" size="sm" disabled={isSaving}>
               {isSaving ? "Saving..." : "Save note"}
             </Button>
-            {error && <span className="text-sm text-red-600">{error}</span>}
+            {noteUpdatedAt && (
+              <p
+                suppressHydrationWarning
+                className="text-xs text-muted-foreground"
+              >
+                Last edited {formatRelativeTime(noteUpdatedAt)}
+              </p>
+            )}
           </div>
         </fetcher.Form>
       </CardContent>
@@ -1807,6 +1812,9 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
         typeof error.data === "string"
           ? error.data
           : "Please select a user from the DevUI panel.";
+    } else if (error.status === 400) {
+      title = "Request could not be completed";
+      message = typeof error.data === "string" ? error.data : error.statusText;
     } else {
       title = `Error ${error.status}`;
       message = typeof error.data === "string" ? error.data : error.statusText;
